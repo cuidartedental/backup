@@ -1,55 +1,68 @@
-import os.path
-from google.auth.transport.requests import Request
+import os
 import json
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from app.config.settings import settings
-import os
 
-# Solo necesitamos permiso para archivos creados por la app
+# Definir los alcances (Scopes)
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
-def get_drive_service():
+def get_credentials():
+    """Obtiene credenciales válidas desde Variables de Entorno o Archivo Local."""
     creds = None
 
-    # RUTA SENIOR: Intentar cargar token desde variable de entorno primero
-    token_data = os.getenv("GOOGLE_TOKEN_JSON")
+    # 1. Intentar cargar desde Variable de Entorno (Prioridad para Render)
+    if settings.GOOGLE_TOKEN_JSON:
+        try:
+            token_data = json.loads(settings.GOOGLE_TOKEN_JSON)
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        except Exception as e:
+            print(f"Error al cargar token desde variable de entorno: {e}")
 
-    if token_data:
-        # Cargamos las credenciales directamente desde el string JSON
-        creds_info = json.loads(token_data)
-        creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
-
-    # Si no hay variable (desarrollo local), buscar archivo físico
-    elif os.path.exists("credentials/token.json"):
+    # 2. Intentar cargar desde archivo físico (Para desarrollo local)
+    if not creds and os.path.exists("credentials/token.json"):
         creds = Credentials.from_authorized_user_file("credentials/token.json", SCOPES)
 
-    # Si el token expiró y tenemos client_secrets, refrescamos
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request
-
+    # 3. Refrescar el token si ha expirado
+    if creds and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            # En producción (Render), esto fallaría porque no hay interfaz gráfica
-            # Por eso es vital subir el GOOGLE_TOKEN_JSON inicial
-            raise Exception(
-                "No hay token válido. Genera el token.json localmente primero."
-            )
+            # Si estamos en local, intentamos guardar el token actualizado al disco
+            if not settings.GOOGLE_TOKEN_JSON and os.path.exists("credentials"):
+                with open("credentials/token.json", "w") as token:
+                    token.write(creds.to_json())
+        except Exception as e:
+            print(f"No se pudo refrescar el token: {e}")
+            creds = None
+
+    return creds
+
+
+def get_drive_service():
+    """Crea y retorna el cliente de Google Drive."""
+    creds = get_credentials()
+    if not creds:
+        raise Exception("No se pudieron obtener credenciales para Google Drive.")
 
     return build("drive", "v3", credentials=creds)
 
 
-def upload_to_drive(file_path: str, filename: str) -> str:
+def upload_to_drive(file_path: str, filename: str):
+    """Sube un archivo a Google Drive y devuelve el link de acceso."""
     try:
         service = get_drive_service()
-        file_metadata = {"name": filename, "parents": [settings.GOOGLE_DRIVE_FOLDER_ID]}
-        media = MediaFileUpload(file_path, resumable=True)
 
-        # Ya no necesitamos supportsAllDrives porque ahora eres TÚ quien sube
+        file_metadata = {"name": filename, "parents": [settings.GOOGLE_DRIVE_FOLDER_ID]}
+
+        media = MediaFileUpload(
+            file_path,
+            mimetype="application/octet-stream",  # Genérico para cualquier archivo
+            resumable=True,
+        )
+
         file = (
             service.files()
             .create(body=file_metadata, media_body=media, fields="id, webViewLink")
@@ -57,21 +70,7 @@ def upload_to_drive(file_path: str, filename: str) -> str:
         )
 
         return file.get("webViewLink")
-    except Exception as e:
-        print(f"Error subiendo a Drive: {e}")
-        return None
 
-
-def list_drive_files():
-    try:
-        service = get_drive_service()
-        query = f"'{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
-        results = (
-            service.files()
-            .list(q=query, pageSize=20, fields="files(id, name, webViewLink)")
-            .execute()
-        )
-        return results.get("files", [])
     except Exception as e:
-        print(f"Error listando: {e}")
-        return []
+        print(f"Error en upload_to_drive: {str(e)}")
+        raise e
